@@ -1,0 +1,386 @@
+# Provenance Guard — CLAUDE.md
+
+> **Every agent reads this file before writing a single line of code.**
+> This is the authoritative spec. Do not invent thresholds, label text, or
+> API fields not listed here.
+
+---
+
+## Project Overview
+
+Provenance Guard is a Flask backend API that classifies submitted text as
+AI-generated or human-written, returning a structured JSON response with a
+confidence score and a plain-language transparency label. It also handles
+creator appeals and maintains a structured SQLite audit log.
+
+**Course:** AI201 Project 4 — 25 pts required + 4 pts bonus  
+**Key file:** `groq_key.env` (never commit it — already in .gitignore)
+
+---
+
+## Environment
+
+- **API key file:** `groq_key.env` in project root
+- **Load pattern:** `load_dotenv("groq_key.env")` at the top of `app.py`
+- **Key name:** `GROQ_API_KEY`
+- **Python:** use `python3`
+
+---
+
+## Tech Stack
+
+| Component      | Package          | Version    |
+|----------------|------------------|------------|
+| API framework  | Flask            | >= 3.0.0   |
+| Rate limiting  | Flask-Limiter    | >= 3.5.0   |
+| LLM API        | groq             | 0.15.0     |
+| Env loading    | python-dotenv    | 1.0.1      |
+| Audit storage  | sqlite3 (stdlib) | built-in   |
+
+---
+
+## Project File Structure
+
+```
+app.py                         ← Flask entry point, all routes
+labels.py                      ← transparency label generation (3 variants)
+requirements.txt
+groq_key.env                   ← NEVER COMMIT
+.gitignore
+pipeline/
+  __init__.py
+  groq_signal.py               ← Signal 1: Groq LLM classifier
+  stylometric.py               ← Signal 2: statistical heuristics
+  combiner.py                  ← weighted score fusion → confidence
+models/
+  __init__.py
+  audit.py                     ← SQLite audit log (write + read)
+  appeal.py                    ← appeal logic + status updates
+provenance.db                  ← SQLite database (gitignored)
+planning.md                    ← spec document (M2 deliverable)
+README.md                      ← documentation (M6 deliverable)
+.claude/
+  commands/
+    pg-analyze.md
+    pg-test-labels.md
+    pg-audit.md
+    pg-appeal.md
+    pg-ratelimit.md
+    pg-validate.md
+```
+
+---
+
+## Detection Signal 1: Groq LLM Classification
+
+**File:** `pipeline/groq_signal.py`  
+**Model:** `llama-3.3-70b-versatile`  
+**Weight in final score:** 0.6
+
+**What it measures:** Whether writing reads as AI output — uniform register,
+hedged corporate phrasing ("it is important to note"), parallel sentence
+structures, absence of personal voice, predictable rhetorical patterns.
+
+**Output:** `float` in range [0.0, 1.0] — 1.0 = confident AI-generated
+
+**Prompt design:** Ask the model to rate 0–10 how likely the text is
+AI-generated, return JSON `{"score": int, "rationale": str}`.
+Normalize to 0–1 by dividing by 10.
+
+**Blind spot:** Cannot detect lightly-edited AI text. May misclassify
+non-native English speakers who write formally. Short texts (<30 words)
+give insufficient signal.
+
+---
+
+## Detection Signal 2: Stylometric Heuristics
+
+**File:** `pipeline/stylometric.py`  
+**Weight in final score:** 0.4
+
+**What it measures:** Three structural/statistical properties:
+
+1. **Sentence length variance (SLV):** AI text has more uniform sentence
+   lengths. Compute std dev of sentence lengths, normalize, invert so
+   low variance → high AI score.
+2. **Type-token ratio (TTR):** `unique_words / total_words`. AI text has
+   lower TTR (repetitive vocabulary). Low TTR → high AI score.
+3. **Punctuation density (PD):** AI text uses fewer, more predictable
+   punctuation marks. Low density → high AI score.
+
+Final stylometric score = average of the three normalized sub-signals.
+
+**Output:** `float` in range [0.0, 1.0] — 1.0 = structurally AI-like
+
+**Blind spot:** Academic/legal human writing scores as AI-like due to
+vocabulary uniformity. Texts under 50 words produce unreliable statistics.
+
+---
+
+## Confidence Scoring Formula
+
+```
+final_confidence = (0.6 × groq_score) + (0.4 × stylometric_score)
+```
+
+Both inputs must be clamped to [0.0, 1.0] before combination.  
+**File:** `pipeline/combiner.py`  
+**Function:** `combine_signals(groq_score: float, stylometric_score: float) -> float`
+
+---
+
+## Label Tier Thresholds
+
+| final_confidence | Tier           | attribution field  |
+|------------------|----------------|--------------------|
+| > 0.75           | High-AI        | `"likely_ai"`      |
+| 0.40 – 0.75      | Uncertain      | `"uncertain"`      |
+| < 0.40           | High-Human     | `"likely_human"`   |
+
+**Why asymmetric:** False positives (labeling human work as AI) are worse
+than false negatives on a creative platform. We require >0.75 confidence
+before issuing an AI label.
+
+---
+
+## Transparency Label Variants (Exact Required Text)
+
+These strings must appear verbatim in `labels.py` and in the README.
+
+**VARIANT A — likely_ai (confidence > 0.75):**
+```
+"This content was likely generated by AI. Our analysis found patterns strongly
+associated with AI-generated writing, including uniform sentence structure and
+consistent vocabulary use. If you created this yourself, you can submit an appeal."
+```
+
+**VARIANT B — uncertain (confidence 0.40–0.75):**
+```
+"We're not sure whether this was written by a person or an AI. Some patterns
+in this content are consistent with AI-generated writing, but we don't have
+enough confidence to make a definitive call. Creators who wrote this themselves
+can submit an appeal."
+```
+
+**VARIANT C — likely_human (confidence < 0.40):**
+```
+"This content appears to have been written by a person. Our analysis found
+the kind of variation in style, vocabulary, and structure that's typical
+of human writing."
+```
+
+**File:** `labels.py`  
+**Function:** `get_label(confidence: float) -> dict`  
+**Returns:** `{"tier": "likely_ai|uncertain|likely_human", "text": "..."}`
+
+---
+
+## API Contract
+
+### POST /submit
+**Rate limit:** 10 per minute; 100 per day
+
+**Request:**
+```json
+{
+  "text": "The piece of writing to analyze...",
+  "creator_id": "user-identifier"
+}
+```
+
+**Response 200:**
+```json
+{
+  "content_id": "3f7a2b1e-uuid-v4",
+  "creator_id": "user-identifier",
+  "attribution": "likely_ai",
+  "confidence": 0.82,
+  "groq_score": 0.85,
+  "stylometric_score": 0.76,
+  "label": "This content was likely generated by AI...",
+  "status": "classified",
+  "timestamp": "2025-04-01T14:32:10.123456+00:00"
+}
+```
+
+**Response 400:** Missing text or creator_id  
+**Response 429:** Rate limit exceeded
+
+---
+
+### POST /appeal
+**Request:**
+```json
+{
+  "content_id": "3f7a2b1e-uuid-v4",
+  "creator_reasoning": "I wrote this myself..."
+}
+```
+
+**Response 200:**
+```json
+{
+  "message": "Appeal received. Your content is now under review.",
+  "content_id": "3f7a2b1e-uuid-v4",
+  "status": "under_review"
+}
+```
+
+**Response 400:** Missing fields  
+**Response 404:** content_id not found
+
+---
+
+### GET /log
+**Response 200:**
+```json
+{
+  "entries": [
+    {
+      "content_id": "uuid",
+      "creator_id": "user-id",
+      "timestamp": "ISO-8601",
+      "attribution": "likely_ai",
+      "confidence": 0.82,
+      "groq_score": 0.85,
+      "stylometric_score": 0.76,
+      "status": "classified",
+      "appeal_reasoning": null
+    }
+  ]
+}
+```
+
+---
+
+## Audit Log Entry Requirements (Rubric)
+
+Every submission MUST write a structured SQLite row with ALL of:
+- `content_id` (UUID string)
+- `creator_id` (string)
+- `timestamp` (ISO-8601 string)
+- `attribution` ("likely_ai" | "uncertain" | "likely_human")
+- `confidence` (float)
+- `groq_score` (float)
+- `stylometric_score` (float)
+- `status` ("classified" | "under_review")
+- `appeal_reasoning` (null or string)
+
+**Grading minimum:** 3 submissions + at least 1 appeal visible in GET /log.
+
+---
+
+## Rate Limiting Configuration
+
+```python
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",   # required for Flask-Limiter >= 3.x
+)
+
+# Applied to POST /submit only:
+@limiter.limit("10 per minute;100 per day")
+```
+
+**Reasoning:** A legitimate writer rarely needs >10 submissions per minute;
+100/day covers a prolific session. These stop script floods without blocking
+any genuine creative workflow.
+
+---
+
+## Agent Roster
+
+| Agent            | Milestone | Files Owned                                         |
+|------------------|-----------|-----------------------------------------------------|
+| ArchitectAgent   | M1 + M2   | `planning.md` only                                  |
+| CoreAPIAgent     | M3        | `app.py`, `pipeline/groq_signal.py`, `models/audit.py` |
+| PipelineAgent    | M4        | `pipeline/stylometric.py`, `pipeline/combiner.py`, updates `app.py` |
+| ProductionAgent  | M5        | `labels.py`, `models/appeal.py`, adds rate limiting + appeal route to `app.py` |
+| DocsAgent        | M6        | `README.md`                                         |
+
+---
+
+## Rubric Checkpoints (Complete List — DocsAgent verifies all)
+
+**Content Submission (3 pts)**
+- POST /submit returns structured JSON: content_id + attribution + confidence + label text
+- Response includes transparency label text (not just a score)
+
+**Multi-Signal Detection (2 pts)**
+- README names 2 signals with what each measures AND what each misses
+- Both signal scores visible in API response
+
+**Confidence Scoring (2 pts)**
+- 2 example submissions in README with noticeably different scores
+- README explains combination formula + how scores were validated
+
+**Transparency Label (3 pts)**
+- README contains verbatim text of all 3 label variants (typed, not screenshot)
+- Labels use plain language — zero jargon ("classifier", "logit", "score")
+- High-AI and high-human labels differ in wording, not just a number
+
+**Appeals (2 pts)**
+- POST /appeal accepts creator_reasoning + sets status to "under_review"
+- Appeal entry visible in GET /log with appeal_reasoning populated
+
+**Rate Limiting (2 pts)**
+- 429 response demonstrated (fire 12 rapid requests)
+- README documents specific limits + reasoning tied to realistic usage
+
+**Audit Log (3 pts)**
+- GET /log returns 3+ structured JSON entries with attribution + confidence + timestamp
+- Format is structured (JSON) — not unformatted console output
+- At least 1 appeal visible alongside its original classification
+
+**planning.md (4 pts)**
+- Detection signals described with combination approach
+- Uncertainty thresholds defined specifically (not "it will show a score")
+- All 3 label variants written out with exact text
+- Appeals workflow + 2 edge cases + ## AI Tool Plan section
+
+**README (2 pts)**
+- Known limitations section: specific content type + why (tied to signal properties)
+- Spec reflection: one real way implementation diverged from plan
+
+**AI Usage (2 pts)**
+- 2+ specific instances: what was directed, what AI produced, what was revised
+
+---
+
+## Skills Reference
+
+| Skill            | Command                     | When to Use                                    |
+|------------------|-----------------------------|------------------------------------------------|
+| `/pg-analyze`    | `/pg-analyze <text>`        | Test pipeline on any text, inspect both scores |
+| `/pg-test-labels`| `/pg-test-labels`           | Verify all 3 label variants are reachable      |
+| `/pg-audit`      | `/pg-audit`                 | View audit log entries, check structure        |
+| `/pg-appeal`     | `/pg-appeal <content_id>`   | Submit test appeal, verify log update          |
+| `/pg-ratelimit`  | `/pg-ratelimit`             | Fire 12 rapid requests, capture 429 evidence  |
+| `/pg-validate`   | `/pg-validate`              | Final rubric checkpoint sweep before submit    |
+
+---
+
+## Run Commands
+
+```bash
+# First-time setup
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Start the app
+python3 app.py
+
+# Test submission
+curl -s -X POST http://localhost:5001/submit \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Your text here", "creator_id": "test-user-1"}' | python3 -m json.tool
+
+# View log
+curl -s http://localhost:5001/log | python3 -m json.tool
+```

@@ -1,0 +1,9 @@
+groq_key.env
+.env
+provenance.db
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.db-journal
